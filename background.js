@@ -268,8 +268,8 @@ async function clickPlayerDownloadInTab(tabId) {
             const sleep = (ms) =>
                 new Promise((resolve) => setTimeout(resolve, ms));
             const downloadText = /(動画をダウンロード|Download video)/i;
-            const settingsText =
-                /(設定|Settings|Playback|More|その他|オプション)/i;
+            const menuTriggerText =
+                /(共有|Share|シェア|もっと見る|More|設定|Settings|オプション|その他)/i;
 
             const isVisible = (el) => {
                 if (!el) return false;
@@ -305,11 +305,47 @@ async function clickPlayerDownloadInTab(tabId) {
                 return null;
             };
 
-            const tryClickDownload = () => {
+            const tryDownloadAction = () => {
                 const item = findDownloadItem();
-                if (!item) return { clicked: false, href: "" };
+                if (!item) return { found: false, clicked: false, href: "" };
+
+                const href = item.href || "";
+                const hrefLooksUsable =
+                    /^https?:\/\//.test(href) &&
+                    /(video\.twimg\.com|\.mp4(\?|$))/i.test(href);
+
+                if (hrefLooksUsable) {
+                    return { found: true, clicked: false, href };
+                }
+
                 item.target.click();
-                return { clicked: true, href: item.href };
+                return { found: true, clicked: true, href };
+            };
+
+            const clickElement = (el) => {
+                if (!el) return;
+                el.dispatchEvent(
+                    new MouseEvent("mouseover", {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window,
+                    }),
+                );
+                el.dispatchEvent(
+                    new MouseEvent("mousedown", {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window,
+                    }),
+                );
+                el.dispatchEvent(
+                    new MouseEvent("mouseup", {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window,
+                    }),
+                );
+                el.click();
             };
 
             const video = document.querySelector("video");
@@ -318,19 +354,29 @@ async function clickPlayerDownloadInTab(tabId) {
             }
 
             video.scrollIntoView({ behavior: "instant", block: "center" });
-            video.dispatchEvent(
-                new MouseEvent("mousemove", {
-                    bubbles: true,
-                    cancelable: true,
-                    view: window,
-                }),
-            );
-            video.click();
+            clickElement(video);
             await sleep(300);
 
             const videoRect = video.getBoundingClientRect();
+            const seededTargets = Array.from(
+                document.querySelectorAll(
+                    [
+                        "[data-testid='shareButton']",
+                        "[data-testid='share']",
+                        "[data-testid='caret']",
+                        "[aria-label*='共有']",
+                        "[aria-label*='Share']",
+                        "[aria-label*='もっと']",
+                        "[aria-label*='More']",
+                        "button[aria-haspopup='menu']",
+                    ].join(","),
+                ),
+            );
+
             const allButtons = Array.from(
-                document.querySelectorAll("button,[role='button']"),
+                document.querySelectorAll(
+                    "button,[role='button'],a[role='button']",
+                ),
             ).filter((el) => {
                 if (!isVisible(el)) return false;
                 const rect = el.getBoundingClientRect();
@@ -344,7 +390,7 @@ async function clickPlayerDownloadInTab(tabId) {
                     button.innerText ||
                     ""
                 ).trim();
-                return settingsText.test(label);
+                return menuTriggerText.test(label);
             });
 
             const nearbyButtons = allButtons
@@ -375,19 +421,35 @@ async function clickPlayerDownloadInTab(tabId) {
                 });
 
             const ordered = Array.from(
-                new Set([...labeledButtons, ...nearbyButtons]),
-            ).slice(0, 40);
+                new Set([
+                    ...seededTargets,
+                    ...labeledButtons,
+                    ...nearbyButtons,
+                ]),
+            ).slice(0, 55);
+
+            const directAttempt = tryDownloadAction();
+            if (directAttempt.found) {
+                return {
+                    ok: true,
+                    mode: "direct-visible",
+                    href: directAttempt.href,
+                    clicked: directAttempt.clicked,
+                    candidateCount: ordered.length,
+                };
+            }
 
             for (const button of ordered) {
-                button.click();
+                clickElement(button);
                 await sleep(320);
-                const hit = tryClickDownload();
-                if (hit.clicked) {
+                const hit = tryDownloadAction();
+                if (hit.found) {
                     return {
                         ok: true,
                         mode: "menu",
                         href: hit.href,
-                        clicked: true,
+                        clicked: hit.clicked,
+                        candidateCount: ordered.length,
                     };
                 }
                 document.dispatchEvent(
@@ -401,17 +463,22 @@ async function clickPlayerDownloadInTab(tabId) {
                 await sleep(100);
             }
 
-            const direct = tryClickDownload();
-            if (direct.clicked) {
+            const direct = tryDownloadAction();
+            if (direct.found) {
                 return {
                     ok: true,
                     mode: "direct",
                     href: direct.href,
-                    clicked: true,
+                    clicked: direct.clicked,
+                    candidateCount: ordered.length,
                 };
             }
 
-            return { ok: false, reason: "download menu not found" };
+            return {
+                ok: false,
+                reason: "download menu not found",
+                candidateCount: ordered.length,
+            };
         },
     });
 
@@ -422,6 +489,7 @@ async function clickPlayerDownloadInTab(tabId) {
             href: "",
             mode: "none",
             clicked: false,
+            candidateCount: 0,
         }
     );
 }
@@ -477,6 +545,26 @@ async function triggerPlayerDownloadForTweet(tweetUrl) {
             }
         }
     }
+}
+
+async function findRecentVideoDownload(sinceMs) {
+    const items = await chrome.downloads.search({
+        limit: 20,
+        orderBy: ["-startTime"],
+    });
+
+    for (const item of items) {
+        const startedAt = Date.parse(item.startTime || "");
+        if (!Number.isFinite(startedAt)) continue;
+        if (startedAt < sinceMs - 2500) continue;
+
+        const haystack =
+            `${item.filename || ""} ${item.url || ""} ${item.finalUrl || ""}`.toLowerCase();
+        if (haystack.includes("video.twimg.com") || haystack.includes(".mp4")) {
+            return item;
+        }
+    }
+    return null;
 }
 
 async function runJob(jobId) {
@@ -607,6 +695,7 @@ async function runJob(jobId) {
                 );
                 await persistJob(job);
 
+                const attemptStartedAt = Date.now();
                 const result = await triggerPlayerDownloadForTweet(tweetUrl);
                 if (result.ok && result.href) {
                     try {
@@ -625,7 +714,7 @@ async function runJob(jobId) {
                         downloadedVideoCount += 1;
                         addLog(
                             job,
-                            `プレイヤーDL成功 (${current}/${videoTweetUrls.size})`,
+                            `プレイヤーDL成功 (${current}/${videoTweetUrls.size}, mode:${result.mode}, 候補:${result.candidateCount || 0})`,
                         );
                     } catch (error) {
                         failedCount += 1;
@@ -635,15 +724,27 @@ async function runJob(jobId) {
                         );
                     }
                 } else if (result.ok && result.clicked) {
-                    addLog(
-                        job,
-                        `メニュークリックは成功しましたが、DL URLを取得できませんでした: ${result.targetUrl || tweetUrl}`,
-                    );
+                    const recent =
+                        await findRecentVideoDownload(attemptStartedAt);
+                    if (recent) {
+                        downloadedCount += 1;
+                        downloadedVideoCount += 1;
+                        addLog(
+                            job,
+                            `プレイヤーDL成功(ブラウザDL検知) (${current}/${videoTweetUrls.size})`,
+                        );
+                    } else {
+                        failedCount += 1;
+                        addLog(
+                            job,
+                            `メニュークリック後のDL検知に失敗: ${result.targetUrl || tweetUrl}`,
+                        );
+                    }
                 } else {
                     failedCount += 1;
                     addLog(
                         job,
-                        `プレイヤーDL失敗 (${current}/${videoTweetUrls.size}): ${result.reason || "unknown"}`,
+                        `プレイヤーDL失敗 (${current}/${videoTweetUrls.size}): ${result.reason || "unknown"} (候補:${result.candidateCount || 0})`,
                     );
                 }
 
