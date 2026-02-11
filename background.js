@@ -200,21 +200,20 @@ async function scrapeStep(tabId, includeVideos) {
                     );
                     if (!hasVideo) continue;
 
-                    const statusLink = article.querySelector(
-                        "a[href*='/status/']",
+                    const statusAnchors = Array.from(
+                        article.querySelectorAll("a[href*='/status/']"),
                     );
-                    if (!statusLink) continue;
-
-                    try {
-                        const normalized = new URL(
-                            statusLink.getAttribute("href") || "",
-                            location.origin,
-                        );
-                        normalized.search = "";
-                        normalized.hash = "";
-                        videoTweetUrls.add(normalized.toString());
-                    } catch (_error) {
-                        // ignore
+                    for (const anchor of statusAnchors) {
+                        const href = anchor.getAttribute("href") || "";
+                        if (!href.includes("/status/")) continue;
+                        try {
+                            const normalized = new URL(href, location.origin);
+                            normalized.search = "";
+                            normalized.hash = "";
+                            videoTweetUrls.add(normalized.toString());
+                        } catch (_error) {
+                            // ignore
+                        }
                     }
                 }
 
@@ -269,6 +268,8 @@ async function clickPlayerDownloadInTab(tabId) {
             const sleep = (ms) =>
                 new Promise((resolve) => setTimeout(resolve, ms));
             const downloadText = /(動画をダウンロード|Download video)/i;
+            const settingsText =
+                /(設定|Settings|Playback|More|その他|オプション)/i;
 
             const isVisible = (el) => {
                 if (!el) return false;
@@ -282,7 +283,7 @@ async function clickPlayerDownloadInTab(tabId) {
                 );
             };
 
-            const clickDownloadItemIfVisible = () => {
+            const findDownloadItem = () => {
                 const nodes = document.querySelectorAll(
                     "[role='menuitem'],button,a,div,span",
                 );
@@ -294,12 +295,21 @@ async function clickPlayerDownloadInTab(tabId) {
                         ""
                     ).trim();
                     if (!downloadText.test(text)) continue;
-                    const clickable =
+                    const target =
                         node.closest("button,a,[role='menuitem']") || node;
-                    clickable.click();
-                    return true;
+                    const anchor =
+                        target.closest("a[href]") || node.closest("a[href]");
+                    const href = anchor?.href || "";
+                    return { target, href };
                 }
-                return false;
+                return null;
+            };
+
+            const tryClickDownload = () => {
+                const item = findDownloadItem();
+                if (!item) return { clicked: false, href: "" };
+                item.target.click();
+                return { clicked: true, href: item.href };
             };
 
             const video = document.querySelector("video");
@@ -316,32 +326,69 @@ async function clickPlayerDownloadInTab(tabId) {
                 }),
             );
             video.click();
-            await sleep(250);
-
-            if (clickDownloadItemIfVisible()) {
-                return { ok: true, mode: "direct" };
-            }
+            await sleep(300);
 
             const videoRect = video.getBoundingClientRect();
-            const candidates = Array.from(
+            const allButtons = Array.from(
                 document.querySelectorAll("button,[role='button']"),
             ).filter((el) => {
                 if (!isVisible(el)) return false;
                 const rect = el.getBoundingClientRect();
-                const cx = (rect.left + rect.right) / 2;
-                const cy = (rect.top + rect.bottom) / 2;
-                const inX =
-                    cx >= videoRect.left - 200 && cx <= videoRect.right + 200;
-                const inY =
-                    cy >= videoRect.top - 120 && cy <= videoRect.bottom + 120;
-                return inX && inY;
+                return rect.width > 6 && rect.height > 6;
             });
 
-            for (const button of candidates.slice(0, 28)) {
+            const labeledButtons = allButtons.filter((button) => {
+                const label = (
+                    button.getAttribute("aria-label") ||
+                    button.getAttribute("title") ||
+                    button.innerText ||
+                    ""
+                ).trim();
+                return settingsText.test(label);
+            });
+
+            const nearbyButtons = allButtons
+                .filter((button) => {
+                    const rect = button.getBoundingClientRect();
+                    const cx = (rect.left + rect.right) / 2;
+                    const cy = (rect.top + rect.bottom) / 2;
+                    const inX =
+                        cx >= videoRect.left - 260 &&
+                        cx <= videoRect.right + 260;
+                    const inY =
+                        cy >= videoRect.top - 160 &&
+                        cy <= videoRect.bottom + 160;
+                    return inX && inY;
+                })
+                .sort((a, b) => {
+                    const ar = a.getBoundingClientRect();
+                    const br = b.getBoundingClientRect();
+                    const ad = Math.hypot(
+                        ar.right - videoRect.right,
+                        ar.bottom - videoRect.bottom,
+                    );
+                    const bd = Math.hypot(
+                        br.right - videoRect.right,
+                        br.bottom - videoRect.bottom,
+                    );
+                    return ad - bd;
+                });
+
+            const ordered = Array.from(
+                new Set([...labeledButtons, ...nearbyButtons]),
+            ).slice(0, 40);
+
+            for (const button of ordered) {
                 button.click();
-                await sleep(300);
-                if (clickDownloadItemIfVisible()) {
-                    return { ok: true, mode: "menu" };
+                await sleep(320);
+                const hit = tryClickDownload();
+                if (hit.clicked) {
+                    return {
+                        ok: true,
+                        mode: "menu",
+                        href: hit.href,
+                        clicked: true,
+                    };
                 }
                 document.dispatchEvent(
                     new KeyboardEvent("keydown", {
@@ -354,25 +401,77 @@ async function clickPlayerDownloadInTab(tabId) {
                 await sleep(100);
             }
 
+            const direct = tryClickDownload();
+            if (direct.clicked) {
+                return {
+                    ok: true,
+                    mode: "direct",
+                    href: direct.href,
+                    clicked: true,
+                };
+            }
+
             return { ok: false, reason: "download menu not found" };
         },
     });
 
-    return result?.result || { ok: false, reason: "script failed" };
+    return (
+        result?.result || {
+            ok: false,
+            reason: "script failed",
+            href: "",
+            mode: "none",
+            clicked: false,
+        }
+    );
+}
+
+function normalizeTweetUrlForVideo(tweetUrl) {
+    try {
+        const url = new URL(tweetUrl);
+        url.search = "";
+        url.hash = "";
+        if (/\/status\/\d+$/.test(url.pathname)) {
+            url.pathname = `${url.pathname}/video/1`;
+        }
+        return url.toString();
+    } catch (_error) {
+        return tweetUrl;
+    }
 }
 
 async function triggerPlayerDownloadForTweet(tweetUrl) {
     let tabId = null;
+    let previousActiveTabId = null;
     try {
-        const tab = await chrome.tabs.create({ url: tweetUrl, active: false });
+        const [activeTab] = await chrome.tabs.query({
+            active: true,
+            lastFocusedWindow: true,
+        });
+        previousActiveTabId = activeTab?.id || null;
+
+        const targetUrl = normalizeTweetUrlForVideo(tweetUrl);
+        const tab = await chrome.tabs.create({ url: targetUrl, active: true });
         tabId = tab.id;
-        await waitForTabComplete(tabId);
-        await delay(1200);
-        return await clickPlayerDownloadInTab(tabId);
+        await waitForTabComplete(tabId, 60000);
+        await delay(1800);
+        const result = await clickPlayerDownloadInTab(tabId);
+        return {
+            ...result,
+            tweetUrl,
+            targetUrl,
+        };
     } finally {
         if (tabId !== null) {
             try {
                 await chrome.tabs.remove(tabId);
+            } catch (_error) {
+                // ignore
+            }
+        }
+        if (previousActiveTabId !== null) {
+            try {
+                await chrome.tabs.update(previousActiveTabId, { active: true });
             } catch (_error) {
                 // ignore
             }
@@ -502,10 +601,44 @@ async function runJob(jobId) {
             let current = 0;
             for (const tweetUrl of videoTweetUrls) {
                 current += 1;
+                addLog(
+                    job,
+                    `プレイヤーDL試行 (${current}/${videoTweetUrls.size}): ${tweetUrl}`,
+                );
+                await persistJob(job);
+
                 const result = await triggerPlayerDownloadForTweet(tweetUrl);
-                if (result.ok) {
-                    downloadedCount += 1;
-                    downloadedVideoCount += 1;
+                if (result.ok && result.href) {
+                    try {
+                        await chrome.downloads.download({
+                            url: result.href,
+                            filename: buildFilename(
+                                job.username,
+                                current,
+                                result.href,
+                                "video",
+                            ),
+                            conflictAction: "uniquify",
+                            saveAs: false,
+                        });
+                        downloadedCount += 1;
+                        downloadedVideoCount += 1;
+                        addLog(
+                            job,
+                            `プレイヤーDL成功 (${current}/${videoTweetUrls.size})`,
+                        );
+                    } catch (error) {
+                        failedCount += 1;
+                        addLog(
+                            job,
+                            `プレイヤーURLのDL失敗 (${current}/${videoTweetUrls.size}): ${serializeError(error)}`,
+                        );
+                    }
+                } else if (result.ok && result.clicked) {
+                    addLog(
+                        job,
+                        `メニュークリックは成功しましたが、DL URLを取得できませんでした: ${result.targetUrl || tweetUrl}`,
+                    );
                 } else {
                     failedCount += 1;
                     addLog(
@@ -526,6 +659,19 @@ async function runJob(jobId) {
             }
         }
 
+        const shouldFallbackToDirectVideo =
+            job.includeVideos &&
+            job.playerDownloadMode &&
+            videoTweetUrls.size > 0 &&
+            downloadedVideoCount === 0;
+        if (shouldFallbackToDirectVideo) {
+            addLog(
+                job,
+                "プレイヤー方式で動画を取得できなかったため、動画URL方式へフォールバックします。",
+            );
+            await persistJob(job);
+        }
+
         if (
             job.includeVideos &&
             job.playerDownloadMode &&
@@ -541,7 +687,8 @@ async function runJob(jobId) {
         const entries = Array.from(found.values()).filter((item) => {
             if (item.mediaType === "image") return true;
             if (!job.playerDownloadMode) return true;
-            return videoTweetUrls.size === 0;
+            if (videoTweetUrls.size === 0) return true;
+            return shouldFallbackToDirectVideo;
         });
         let index = 1;
         for (const item of entries) {
