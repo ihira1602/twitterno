@@ -3,6 +3,7 @@ const accountInput = document.getElementById("account-input");
 const maxScrollsInput = document.getElementById("max-scrolls");
 const delayMsInput = document.getElementById("delay-ms");
 const includeVideosInput = document.getElementById("include-videos");
+const playerDownloadModeInput = document.getElementById("player-download-mode");
 const startButton = document.getElementById("start-button");
 
 const statusCard = document.getElementById("status-card");
@@ -112,6 +113,7 @@ form.addEventListener("submit", async (event) => {
         maxScrolls: maxScrollsInput.value,
         delayMs: delayMsInput.value,
         includeVideos: includeVideosInput.checked,
+        playerDownloadMode: playerDownloadModeInput.checked,
     });
 
     if (!response?.ok) {
@@ -122,6 +124,12 @@ form.addEventListener("submit", async (event) => {
 
     startPolling(response.jobId);
 });
+
+includeVideosInput.addEventListener("change", () => {
+    playerDownloadModeInput.disabled = !includeVideosInput.checked;
+});
+
+playerDownloadModeInput.disabled = !includeVideosInput.checked;
 
 async function loadLastJob() {
     const response = await chrome.runtime.sendMessage({ type: "last-job" });
