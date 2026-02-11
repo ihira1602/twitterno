@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>twitterno</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="app">
+      <h1>twitterno</h1>
+      <p class="sub">Twitter/Xの画像を一括ダウンロード</p>
+
+      <form id="download-form" class="card">
+        <label for="account-input">アカウント名 or URL</label>
+        <input
+          id="account-input"
+          type="text"
+          placeholder="@jack or https://x.com/jack"
+          required
+        />
+
+        <div class="row">
+          <div>
+            <label for="max-scrolls">最大スクロール回数</label>
+            <input id="max-scrolls" type="number" min="10" max="2000" value="120" />
+          </div>
+          <div>
+            <label for="delay-ms">待機(ms)</label>
+            <input id="delay-ms" type="number" min="300" max="10000" value="1200" />
+          </div>
+        </div>
+
+        <button id="start-button" type="submit">収集してダウンロード</button>
+      </form>
+
+      <section id="status-card" class="card hidden">
+        <h2>ステータス</h2>
+        <p><strong>ID:</strong> <span id="job-id">-</span></p>
+        <p><strong>状態:</strong> <span id="job-status">-</span></p>
+        <p><strong>収集画像:</strong> <span id="found-count">0</span></p>
+        <p><strong>成功:</strong> <span id="downloaded-count">0</span></p>
+        <p><strong>失敗:</strong> <span id="failed-count">0</span></p>
+        <p><strong>スクロール:</strong> <span id="scroll-progress">0/0</span></p>
+        <p><strong>エラー:</strong> <span id="error-text">-</span></p>
+      </section>
+
+      <section id="logs-card" class="card hidden">
+        <h2>ログ</h2>
+        <pre id="logs"></pre>
+      </section>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
