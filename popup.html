@@ -9,7 +9,7 @@
   <body>
     <main class="app">
       <h1>twitterno</h1>
-      <p class="sub">Twitter/Xの画像を一括ダウンロード</p>
+      <p class="sub">Twitter/Xの画像・動画を一括ダウンロード</p>
 
       <form id="download-form" class="card">
         <label for="account-input">アカウント名 or URL</label>
@@ -31,6 +31,11 @@
           </div>
         </div>
 
+        <label class="checkbox">
+          <input id="include-videos" type="checkbox" checked />
+          <span>動画（mp4）も収集する</span>
+        </label>
+
         <button id="start-button" type="submit">収集してダウンロード</button>
       </form>
 
@@ -38,8 +43,12 @@
         <h2>ステータス</h2>
         <p><strong>ID:</strong> <span id="job-id">-</span></p>
         <p><strong>状態:</strong> <span id="job-status">-</span></p>
-        <p><strong>収集画像:</strong> <span id="found-count">0</span></p>
-        <p><strong>成功:</strong> <span id="downloaded-count">0</span></p>
+        <p><strong>収集メディア:</strong> <span id="found-count">0</span></p>
+        <p><strong>収集画像:</strong> <span id="found-image-count">0</span></p>
+        <p><strong>収集動画:</strong> <span id="found-video-count">0</span></p>
+        <p><strong>ダウンロード成功:</strong> <span id="downloaded-count">0</span></p>
+        <p><strong>成功(画像):</strong> <span id="downloaded-image-count">0</span></p>
+        <p><strong>成功(動画):</strong> <span id="downloaded-video-count">0</span></p>
         <p><strong>失敗:</strong> <span id="failed-count">0</span></p>
         <p><strong>スクロール:</strong> <span id="scroll-progress">0/0</span></p>
         <p><strong>エラー:</strong> <span id="error-text">-</span></p>

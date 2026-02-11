@@ -1,19 +1,20 @@
 {
-  "manifest_version": 3,
-  "name": "twitterno",
-  "version": "0.1.0",
-  "description": "Download posted images from a Twitter/X account media page.",
-  "permissions": ["tabs", "scripting", "downloads", "storage"],
-  "host_permissions": [
-    "https://x.com/*",
-    "https://twitter.com/*",
-    "https://pbs.twimg.com/*"
-  ],
-  "action": {
-    "default_title": "twitterno",
-    "default_popup": "popup.html"
-  },
-  "background": {
-    "service_worker": "background.js"
-  }
+    "manifest_version": 3,
+    "name": "twitterno",
+    "version": "0.1.0",
+    "description": "Download posted images from a Twitter/X account media page.",
+    "permissions": ["tabs", "scripting", "downloads", "storage"],
+    "host_permissions": [
+        "https://x.com/*",
+        "https://twitter.com/*",
+        "https://pbs.twimg.com/*",
+        "https://video.twimg.com/*"
+    ],
+    "action": {
+        "default_title": "twitterno",
+        "default_popup": "popup.html"
+    },
+    "background": {
+        "service_worker": "background.js"
+    }
 }

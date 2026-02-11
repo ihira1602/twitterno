@@ -43,18 +43,49 @@ function buildMediaUrl(username) {
   return `https://x.com/${username}/media`;
 }
 
-function buildFilename(username, index, sourceUrl) {
-  let ext = ".jpg";
+function guessExtFromUrl(sourceUrl) {
   try {
     const parsed = new URL(sourceUrl);
+
     const format = parsed.searchParams.get("format");
-    if (format && /^[a-zA-Z0-9]+$/.test(format)) {
-      ext = `.${format.toLowerCase()}`;
+    if (format && /^[a-zA-Z0-9]{2,8}$/.test(format)) {
+      return `.${format.toLowerCase()}`;
+    }
+
+    const extMatch = parsed.pathname.match(/\.([a-zA-Z0-9]{2,8})$/);
+    if (extMatch) {
+      return `.${extMatch[1].toLowerCase()}`;
     }
   } catch (_error) {
-    // keep default extension
+    // fall through
   }
-  return `twitterno/${username}/${String(index).padStart(4, "0")}${ext}`;
+  return "";
+}
+
+function buildFilename(username, index, sourceUrl, mediaType) {
+  const fallbackExt = mediaType === "video" ? ".mp4" : ".jpg";
+  const ext = guessExtFromUrl(sourceUrl) || fallbackExt;
+  const suffix = mediaType === "video" ? "video" : "image";
+  return `twitterno/${username}/${String(index).padStart(4, "0")}-${suffix}${ext}`;
+}
+
+function summarizeFound(found) {
+  let foundImageCount = 0;
+  let foundVideoCount = 0;
+
+  for (const item of found.values()) {
+    if (item.mediaType === "video") {
+      foundVideoCount += 1;
+    } else {
+      foundImageCount += 1;
+    }
+  }
+
+  return {
+    foundCount: found.size,
+    foundImageCount,
+    foundVideoCount,
+  };
 }
 
 async function persistJob(job) {
@@ -104,23 +135,59 @@ function waitForTabComplete(tabId, timeoutMs = 40000) {
   });
 }
 
-async function scrapeStep(tabId) {
+async function scrapeStep(tabId, includeVideos) {
   const [result] = await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
-    func: () => {
-      const urls = new Set();
-      const images = document.querySelectorAll('a[href*="/photo/"] img');
+    args: [Boolean(includeVideos)],
+    func: (includeVideosInPage) => {
+      const imageUrls = new Set();
+      const videoUrls = new Set();
 
-      for (const img of images) {
-        const raw = img.currentSrc || img.src || "";
-        if (!raw || !raw.includes("pbs.twimg.com/media")) continue;
+      const addImage = (raw) => {
+        if (!raw) return;
         try {
           const url = new URL(raw, location.href);
+          if (url.hostname !== "pbs.twimg.com") return;
+          if (!url.pathname.includes("/media/")) return;
           url.searchParams.set("name", "orig");
-          urls.add(url.toString());
+          imageUrls.add(url.toString());
         } catch (_error) {
           // ignore invalid URL
+        }
+      };
+
+      const addVideo = (raw) => {
+        if (!raw || raw.startsWith("blob:")) return;
+        try {
+          const url = new URL(raw, location.href);
+          if (url.hostname !== "video.twimg.com") return;
+
+          const lowerPath = url.pathname.toLowerCase();
+          if (lowerPath.endsWith(".m3u8")) return;
+          if (!lowerPath.includes(".mp4")) return;
+
+          videoUrls.add(url.toString());
+        } catch (_error) {
+          // ignore invalid URL
+        }
+      };
+
+      const imageNodes = document.querySelectorAll('a[href*="/photo/"] img, img[src*="pbs.twimg.com/media"]');
+      for (const img of imageNodes) {
+        addImage(img.currentSrc || img.src || "");
+      }
+
+      if (includeVideosInPage) {
+        const videoNodes = document.querySelectorAll("video");
+        for (const video of videoNodes) {
+          addVideo(video.currentSrc || "");
+          addVideo(video.src || "");
+
+          const sourceNodes = video.querySelectorAll("source[src]");
+          for (const source of sourceNodes) {
+            addVideo(source.src || source.getAttribute("src") || "");
+          }
         }
       }
 
@@ -130,7 +197,8 @@ async function scrapeStep(tabId) {
       const after = scroller.scrollTop;
 
       return {
-        urls: Array.from(urls),
+        imageUrls: Array.from(imageUrls),
+        videoUrls: Array.from(videoUrls),
         before,
         after,
         scrollHeight: scroller.scrollHeight,
@@ -138,7 +206,7 @@ async function scrapeStep(tabId) {
     },
   });
 
-  return result?.result || { urls: [], before: 0, after: 0, scrollHeight: 0 };
+  return result?.result || { imageUrls: [], videoUrls: [], before: 0, after: 0, scrollHeight: 0 };
 }
 
 async function runJob(jobId) {
@@ -146,45 +214,64 @@ async function runJob(jobId) {
   if (!job) return;
 
   let tabId = null;
-  const found = new Set();
+  const found = new Map();
   let downloadedCount = 0;
+  let downloadedImageCount = 0;
+  let downloadedVideoCount = 0;
   let failedCount = 0;
 
   try {
     await updateJob(job, { status: "running", startedAt: nowIso() });
     addLog(job, `mediaページを開きます: ${buildMediaUrl(job.username)}`);
+    addLog(job, job.includeVideos ? "画像+動画の探索を開始します。" : "画像のみ探索します。");
     await persistJob(job);
 
     const tab = await chrome.tabs.create({ url: buildMediaUrl(job.username), active: false });
     tabId = tab.id;
     await waitForTabComplete(tabId);
-    addLog(job, "読み込み完了。画像探索を開始します。");
+    addLog(job, "読み込み完了。メディア探索を実行中...");
     await persistJob(job);
 
     let idleRounds = 0;
     for (let i = 0; i < job.maxScrolls; i += 1) {
       const beforeCount = found.size;
-      const step = await scrapeStep(tabId);
+      const step = await scrapeStep(tabId, job.includeVideos);
 
-      for (const url of step.urls) {
-        found.add(url);
+      for (const url of step.imageUrls) {
+        const key = `image:${url}`;
+        if (!found.has(key)) {
+          found.set(key, { url, mediaType: "image" });
+        }
       }
 
+      if (job.includeVideos) {
+        for (const url of step.videoUrls) {
+          const key = `video:${url}`;
+          if (!found.has(key)) {
+            found.set(key, { url, mediaType: "video" });
+          }
+        }
+      }
+
+      const summary = summarizeFound(found);
       const hasGrowth = found.size > beforeCount;
       idleRounds = hasGrowth ? 0 : idleRounds + 1;
 
       await updateJob(job, {
-        foundCount: found.size,
+        ...summary,
         currentScroll: i + 1,
       });
 
       if ((i + 1) % 10 === 0 || hasGrowth) {
-        addLog(job, `スクロール ${i + 1}/${job.maxScrolls}, 収集画像 ${found.size}`);
+        addLog(
+          job,
+          `スクロール ${i + 1}/${job.maxScrolls}, 収集メディア ${summary.foundCount} (画像 ${summary.foundImageCount}, 動画 ${summary.foundVideoCount})`
+        );
         await persistJob(job);
       }
 
       if (idleRounds >= MAX_IDLE_ROUNDS) {
-        addLog(job, `新規画像が増えないため探索を終了します (${MAX_IDLE_ROUNDS} 回連続)。`);
+        addLog(job, `新規メディアが増えないため探索を終了します (${MAX_IDLE_ROUNDS} 回連続)。`);
         await persistJob(job);
         break;
       }
@@ -192,56 +279,79 @@ async function runJob(jobId) {
       await delay(job.delayMs);
     }
 
-    if (found.size === 0) {
-      addLog(job, "画像が見つかりませんでした。");
-      await updateJob(job, { status: "completed", finishedAt: nowIso() });
+    const summary = summarizeFound(found);
+    if (summary.foundCount === 0) {
+      addLog(job, "メディアが見つかりませんでした。");
+      await updateJob(job, {
+        status: "completed",
+        finishedAt: nowIso(),
+        ...summary,
+      });
       return;
     }
 
-    addLog(job, `${found.size} 件の画像をダウンロードします。`);
+    addLog(job, `${summary.foundCount} 件のメディアをダウンロードします。`);
     await persistJob(job);
 
+    const entries = Array.from(found.values());
     let index = 1;
-    for (const url of found) {
+    for (const item of entries) {
       try {
         await chrome.downloads.download({
-          url,
-          filename: buildFilename(job.username, index, url),
+          url: item.url,
+          filename: buildFilename(job.username, index, item.url, item.mediaType),
           conflictAction: "uniquify",
           saveAs: false,
         });
+
         downloadedCount += 1;
+        if (item.mediaType === "video") {
+          downloadedVideoCount += 1;
+        } else {
+          downloadedImageCount += 1;
+        }
       } catch (error) {
         failedCount += 1;
         addLog(job, `ダウンロード失敗: ${serializeError(error)}`);
       }
 
-      if (index % 10 === 0 || index === found.size) {
+      if (index % 10 === 0 || index === entries.length) {
         await updateJob(job, {
+          ...summary,
           downloadedCount,
+          downloadedImageCount,
+          downloadedVideoCount,
           failedCount,
         });
       }
       index += 1;
     }
 
-    addLog(job, `完了: 成功 ${downloadedCount} / 失敗 ${failedCount}`);
+    addLog(
+      job,
+      `完了: 成功 ${downloadedCount} (画像 ${downloadedImageCount}, 動画 ${downloadedVideoCount}) / 失敗 ${failedCount}`
+    );
     await updateJob(job, {
       status: "completed",
       finishedAt: nowIso(),
-      foundCount: found.size,
+      ...summary,
       downloadedCount,
+      downloadedImageCount,
+      downloadedVideoCount,
       failedCount,
     });
   } catch (error) {
+    const summary = summarizeFound(found);
     addLog(job, `エラー: ${serializeError(error)}`);
     await updateJob(job, {
       status: "failed",
       error: serializeError(error),
       finishedAt: nowIso(),
+      ...summary,
       downloadedCount,
+      downloadedImageCount,
+      downloadedVideoCount,
       failedCount,
-      foundCount: found.size,
     });
   } finally {
     if (tabId !== null) {
@@ -275,11 +385,13 @@ async function startJob(payload) {
 
   const maxScrolls = clampInt(payload?.maxScrolls, DEFAULT_MAX_SCROLLS, 10, 2000);
   const delayMs = clampInt(payload?.delayMs, DEFAULT_DELAY_MS, 300, 10000);
+  const includeVideos = payload?.includeVideos !== false;
   const id = crypto.randomUUID();
 
   const job = {
     id,
     username,
+    includeVideos,
     status: "queued",
     createdAt: nowIso(),
     updatedAt: nowIso(),
@@ -289,7 +401,11 @@ async function startJob(payload) {
     maxScrolls,
     delayMs,
     foundCount: 0,
+    foundImageCount: 0,
+    foundVideoCount: 0,
     downloadedCount: 0,
+    downloadedImageCount: 0,
+    downloadedVideoCount: 0,
     failedCount: 0,
     error: "",
     logs: [],
