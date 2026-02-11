@@ -1,6 +1,7 @@
 const DEFAULT_MAX_SCROLLS = 120;
 const DEFAULT_DELAY_MS = 1200;
-const MAX_IDLE_ROUNDS = 8;
+const MAX_IDLE_ROUNDS = 20;
+const MIN_SCROLLS_BEFORE_IDLE_STOP = 30;
 const USERNAME_REGEX = /^[A-Za-z0-9_]{1,15}$/;
 const jobs = new Map();
 
@@ -103,8 +104,8 @@ async function persistJob(job) {
 
 function addLog(job, message) {
     job.logs.push(`[${new Date().toLocaleTimeString()}] ${message}`);
-    if (job.logs.length > 300) {
-        job.logs = job.logs.slice(-300);
+    if (job.logs.length > 800) {
+        job.logs = job.logs.slice(-800);
     }
 }
 
@@ -117,6 +118,12 @@ async function updateJob(job, patch) {
 function serializeError(error) {
     if (error instanceof Error) return error.message;
     return String(error);
+}
+
+function serializeErrorWithStack(error) {
+    if (!(error instanceof Error)) return String(error);
+    if (!error.stack) return error.message;
+    return `${error.message} | ${error.stack.split("\n").slice(0, 4).join(" | ")}`;
 }
 
 function waitForTabComplete(tabId, timeoutMs = 40000) {
@@ -155,13 +162,21 @@ async function scrapeStep(tabId, includeVideos) {
             const imageUrls = new Set();
             const videoUrls = new Set();
             const videoTweetUrls = new Set();
+            let domImageNodeCount = 0;
+            let domVideoNodeCount = 0;
+            let articleCount = 0;
+            let articleWithVideoCount = 0;
 
             const addImage = (raw) => {
                 if (!raw) return;
                 try {
                     const url = new URL(raw, location.href);
-                    if (url.hostname !== "pbs.twimg.com") return;
-                    if (!url.pathname.includes("/media/")) return;
+                    if (!url.hostname.endsWith("twimg.com")) return;
+                    if (
+                        !url.pathname.includes("/media/") &&
+                        !url.pathname.includes("/ext_tw_video_thumb/")
+                    )
+                        return;
                     url.searchParams.set("name", "orig");
                     imageUrls.add(url.toString());
                 } catch (_error) {
@@ -186,19 +201,22 @@ async function scrapeStep(tabId, includeVideos) {
             };
 
             const imageNodes = document.querySelectorAll(
-                'a[href*="/photo/"] img, img[src*="pbs.twimg.com/media"]',
+                'a[href*="/photo/"] img, img[src*="twimg.com/media"], img[src*="twimg.com/ext_tw_video_thumb"]',
             );
+            domImageNodeCount = imageNodes.length;
             for (const img of imageNodes) {
                 addImage(img.currentSrc || img.src || "");
             }
 
             if (includeVideosInPage) {
                 const articles = document.querySelectorAll("article");
+                articleCount = articles.length;
                 for (const article of articles) {
                     const hasVideo = article.querySelector(
                         "video, [data-testid='playButton'], [aria-label*='Play'], [aria-label*='再生']",
                     );
                     if (!hasVideo) continue;
+                    articleWithVideoCount += 1;
 
                     const statusAnchors = Array.from(
                         article.querySelectorAll("a[href*='/status/']"),
@@ -218,6 +236,7 @@ async function scrapeStep(tabId, includeVideos) {
                 }
 
                 const videoNodes = document.querySelectorAll("video");
+                domVideoNodeCount = videoNodes.length;
                 for (const video of videoNodes) {
                     addVideo(video.currentSrc || "");
                     addVideo(video.src || "");
@@ -241,6 +260,13 @@ async function scrapeStep(tabId, includeVideos) {
                 imageUrls: Array.from(imageUrls),
                 videoUrls: Array.from(videoUrls),
                 videoTweetUrls: Array.from(videoTweetUrls),
+                debug: {
+                    domImageNodeCount,
+                    domVideoNodeCount,
+                    articleCount,
+                    articleWithVideoCount,
+                    locationHref: location.href,
+                },
                 before,
                 after,
                 scrollHeight: scroller.scrollHeight,
@@ -253,6 +279,13 @@ async function scrapeStep(tabId, includeVideos) {
             imageUrls: [],
             videoUrls: [],
             videoTweetUrls: [],
+            debug: {
+                domImageNodeCount: 0,
+                domVideoNodeCount: 0,
+                articleCount: 0,
+                articleWithVideoCount: 0,
+                locationHref: "",
+            },
             before: 0,
             after: 0,
             scrollHeight: 0,
@@ -353,7 +386,7 @@ async function clickPlayerDownloadInTab(tabId) {
                 return { ok: false, reason: "video element not found" };
             }
 
-            video.scrollIntoView({ behavior: "instant", block: "center" });
+            video.scrollIntoView({ behavior: "auto", block: "center" });
             clickElement(video);
             await sleep(300);
 
@@ -549,14 +582,17 @@ async function triggerPlayerDownloadForTweet(tweetUrl) {
 
 async function findRecentVideoDownload(sinceMs) {
     const items = await chrome.downloads.search({
-        limit: 20,
-        orderBy: ["-startTime"],
+        limit: 50,
     });
 
-    for (const item of items) {
+    const sorted = items.slice().sort((a, b) => {
+        return Date.parse(b.startTime || "0") - Date.parse(a.startTime || "0");
+    });
+
+    for (const item of sorted) {
         const startedAt = Date.parse(item.startTime || "");
         if (!Number.isFinite(startedAt)) continue;
-        if (startedAt < sinceMs - 2500) continue;
+        if (startedAt < sinceMs - 5000) continue;
 
         const haystack =
             `${item.filename || ""} ${item.url || ""} ${item.finalUrl || ""}`.toLowerCase();
@@ -584,6 +620,10 @@ async function runJob(jobId) {
         addLog(job, `mediaページを開きます: ${buildMediaUrl(job.username)}`);
         addLog(
             job,
+            `設定: maxScrolls=${job.maxScrolls}, delayMs=${job.delayMs}, includeVideos=${job.includeVideos}, playerDownloadMode=${job.playerDownloadMode}`,
+        );
+        addLog(
+            job,
             job.includeVideos
                 ? "画像+動画の探索を開始します。"
                 : "画像のみ探索します。",
@@ -596,14 +636,38 @@ async function runJob(jobId) {
         });
         tabId = tab.id;
         await waitForTabComplete(tabId);
-        addLog(job, "読み込み完了。メディア探索を実行中...");
+        addLog(job, `読み込み完了。メディア探索を実行中... (tabId=${tabId})`);
         await persistJob(job);
 
         let idleRounds = 0;
         for (let i = 0; i < job.maxScrolls; i += 1) {
             const beforeCount = found.size;
             const beforeVideoTweetCount = videoTweetUrls.size;
-            const step = await scrapeStep(tabId, job.includeVideos);
+            let step = null;
+            let scrapeError = null;
+            for (let attempt = 1; attempt <= 3; attempt += 1) {
+                try {
+                    step = await scrapeStep(tabId, job.includeVideos);
+                    scrapeError = null;
+                    break;
+                } catch (error) {
+                    scrapeError = error;
+                    addLog(
+                        job,
+                        `scrape失敗(${i + 1}回目スクロール, retry=${attempt}/3): ${serializeError(error)}`,
+                    );
+                    await persistJob(job);
+                    await delay(500);
+                }
+            }
+            if (!step) {
+                addLog(
+                    job,
+                    `スクロール${i + 1}でscrapeに失敗したため、この回はスキップします: ${serializeError(scrapeError)}`,
+                );
+                await persistJob(job);
+                continue;
+            }
 
             for (const url of step.imageUrls) {
                 const key = `image:${url}`;
@@ -643,10 +707,20 @@ async function runJob(jobId) {
                 await persistJob(job);
             }
 
-            if (idleRounds >= MAX_IDLE_ROUNDS) {
+            if (i + 1 <= 12 || (i + 1) % 5 === 0 || hasGrowth) {
                 addLog(
                     job,
-                    `新規メディアが増えないため探索を終了します (${MAX_IDLE_ROUNDS} 回連続)。`,
+                    `debug scroll=${i + 1} idle=${idleRounds}/${MAX_IDLE_ROUNDS} growth=${hasGrowth} step(images=${step.imageUrls.length}, videoUrls=${step.videoUrls.length}, videoTweets=${step.videoTweetUrls.length}) dom(images=${step.debug?.domImageNodeCount || 0}, videos=${step.debug?.domVideoNodeCount || 0}, articles=${step.debug?.articleCount || 0}, articleWithVideo=${step.debug?.articleWithVideoCount || 0})`,
+                );
+                await persistJob(job);
+            }
+
+            const canStopByIdle =
+                i + 1 >= Math.min(job.maxScrolls, MIN_SCROLLS_BEFORE_IDLE_STOP);
+            if (idleRounds >= MAX_IDLE_ROUNDS && canStopByIdle) {
+                addLog(
+                    job,
+                    `新規メディアが増えないため探索を終了します (${MAX_IDLE_ROUNDS} 回連続, scroll=${i + 1})。`,
                 );
                 await persistJob(job);
                 break;
@@ -696,7 +770,18 @@ async function runJob(jobId) {
                 await persistJob(job);
 
                 const attemptStartedAt = Date.now();
-                const result = await triggerPlayerDownloadForTweet(tweetUrl);
+                let result;
+                try {
+                    result = await triggerPlayerDownloadForTweet(tweetUrl);
+                } catch (error) {
+                    failedCount += 1;
+                    addLog(
+                        job,
+                        `プレイヤーDL例外 (${current}/${videoTweetUrls.size}): ${serializeErrorWithStack(error)}`,
+                    );
+                    await persistJob(job);
+                    continue;
+                }
                 if (result.ok && result.href) {
                     try {
                         await chrome.downloads.download({
@@ -724,8 +809,13 @@ async function runJob(jobId) {
                         );
                     }
                 } else if (result.ok && result.clicked) {
-                    const recent =
-                        await findRecentVideoDownload(attemptStartedAt);
+                    let recent = null;
+                    for (let check = 0; check < 5; check += 1) {
+                        await delay(700);
+                        recent =
+                            await findRecentVideoDownload(attemptStartedAt);
+                        if (recent) break;
+                    }
                     if (recent) {
                         downloadedCount += 1;
                         downloadedVideoCount += 1;
@@ -744,7 +834,7 @@ async function runJob(jobId) {
                     failedCount += 1;
                     addLog(
                         job,
-                        `プレイヤーDL失敗 (${current}/${videoTweetUrls.size}): ${result.reason || "unknown"} (候補:${result.candidateCount || 0})`,
+                        `プレイヤーDL失敗 (${current}/${videoTweetUrls.size}): ${result.reason || "unknown"} (候補:${result.candidateCount || 0}, mode:${result.mode || "none"})`,
                     );
                 }
 
@@ -844,7 +934,7 @@ async function runJob(jobId) {
         });
     } catch (error) {
         const summary = summarizeFound(found, videoTweetUrls.size);
-        addLog(job, `エラー: ${serializeError(error)}`);
+        addLog(job, `エラー: ${serializeErrorWithStack(error)}`);
         await updateJob(job, {
             status: "failed",
             error: serializeError(error),
